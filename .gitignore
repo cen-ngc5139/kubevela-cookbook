@@ -1,0 +1,56 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin
+_bin
+e2e/vela
+
+# Test binary, build with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+coverage.txt
+
+# Kubernetes Generated files - skip generated files, except for vendored files
+
+!vendor/**/zz_generated.*
+
+# editor and IDE paraphernalia
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Dependency directories (remove the comment below to include it)
+vendor/
+
+# Vscode files
+.vscode
+
+pkg/test/vela
+config/crd/bases
+tmp/
+
+cmd/vela/fake/source.go
+cmd/vela/fake/chart_source.go
+charts/vela-core/crds/_.yaml
+.test_vela
+
+.vela/
+
+# Dashboard
+node_modules/
+.eslintcache
+dashboard/dist/
+dashboard/package-lock.json
+dashboard/src/.umi/
+package-lock.json
+dashboard/src/.umi-production/
+
+# Swagger: generate Restful API
+pkg/server/docs/index.html
