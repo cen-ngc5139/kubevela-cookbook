@@ -838,6 +838,42 @@ func Setup(mgr ctrl.Manager, args controller.Args, l logging.Logger) error {
 }
 ```
 
+#####ApplicationConfiguration(ac)
+
+ApplicationConfiguration，该控制器包含对如下CRD的操作：
+
+- ApplicationConfiguration 
+- WorkloadDefinition
+- TraitDefinition 
+- ScopeDefinition 
+- Component
+
+该控制主要逻辑如下：
+
+1. 消息入队，从 event 队列中获取待处理的 ac event 对象；
+2. 获取对象，从 k8s 中获取当前待处理 ac 对象的终态声明信息；
+3. 执行拦截器，判断当前 ac 对象是否处于待删除状态，如果处于则执行拦截器，从 scope 中删除当前 ac 对象，如果删除成功直接退出当前处理流程；
+4. 执行前置操作，此处一般用于执行外部 webhook，做一些前置校验或者通知操作；
+5. 渲染资源，将 application 中 component 配置渲染成内部 ` workload`  对象、以及依赖关系；
+6. 提交资源，将上一步渲染出来的 `workload` 对象提交创建，包括：workload、trait、scope、以及各 workload 之前的依赖关系；
+7. 执行回收，对 ac 渲染出来的所有对象执行垃圾回收。
+
+#####Application(app)
+
+ApplicationConfiguration，该控制器包含对如下CRD的操作：
+
+- Application
+
+该控制主要逻辑如下：
+
+1. 消息入队，从 event 队列中获取待处理的 app event 对象；
+2. 获取对象，从 k8s 中获取当前待处理 app 对象的终态声明信息；
+3. 渲染资源，从 appfile 转换成 ac 和 component，主要逻辑如下：
+   -  从 ac 中拿到所有 workload，然后从 WorkloadDefinition 和 TraitDefinition 中获取对应对象
+   -  从 Definition 中拿到 cue 定义的模版部分，将 parameter 部分数据渲染到 outputField中完成数据渲染，
+   -  将 workload 渲染出来的数据构建成 Component 对象，将 trait、scope 渲染出来的数据构建 acCompoent
+4. 提交资源，创建上面渲染出来的 ac 和 compoent 组件；
+
 #### ApplicationConfiguration(ac)
 
 ##### CRD
@@ -1474,5 +1510,222 @@ func (r *components) renderTrait(ctx context.Context, ct v1alpha2.ComponentTrait
 	return t, traitDef, nil
 }
 ```
+
+#### Application(app)
+
+##### CRD
+
+```go
+type ApplicationTrait struct {
+  // 用于创建 trait 对象时的名称
+	Name string `json:"name"`
+
+  // 用于渲染 TraitDefinition 中 parameter 部分的参数
+	Properties runtime.RawExtension `json:"properties"`
+}
+
+// ApplicationComponent describe the component of application
+type ApplicationComponent struct {
+  // component 名称，用于创建 component 对象时使用
+	Name         string `json:"name"`
+  // 用于指定 WorkloadDefinition 名称
+	WorkloadType string `json:"type"`
+  // 用于渲染 WorkloadDefinition  中 parameter 部分的参数
+	Settings runtime.RawExtension `json:"settings"`
+  // 用于定义哪些 trait 需要挂载到 component
+	Traits []ApplicationTrait `json:"traits,omitempty"`
+
+	Scopes map[string]string `json:"scopes,omitempty"`
+}
+
+// ApplicationSpec is the spec of Application
+type ApplicationSpec struct {
+  // 用于定义多个组件，相当于前面 ac 中的 component 对象
+	Components []ApplicationComponent `json:"components"`
+
+	RolloutPlan *v1alpha1.RolloutPlan `json:"rolloutPlan,omitempty"`
+}
+
+type Application struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   ApplicationSpec `json:"spec,omitempty"`
+	Status AppStatus       `json:"status,omitempty"`
+}
+```
+
+##### Reconcile
+
+```go
+// Appfile describes application
+// 该对象用于描述 application 对象
+type Appfile struct {
+	Name      string
+	Workloads []*Workload
+}
+```
+
+
+
+```go
+func (r *Reconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
+	ctx := context.Background()
+	applog := r.Log.WithValues("application", req.NamespacedName)
+	app := new(v1alpha2.Application)
+  // 获取入队的 application 对象
+	if err := r.Get(ctx, client.ObjectKey{
+		Name:      req.Name,
+		Namespace: req.Namespace,
+	}, app); err != nil {
+    // 如果还未创建，则退出
+		if kerrors.IsNotFound(err) {
+			err = nil
+		}
+		return ctrl.Result{}, err
+	}
+
+	// TODO: check finalizer
+  // 如果正在被删除，则退出
+	if app.DeletionTimestamp != nil {
+		return ctrl.Result{}, nil
+	}
+
+	applog.Info("Start Rendering")
+
+  // 设置 app 状态为 渲染中
+	app.Status.Phase = v1alpha2.ApplicationRendering
+	handler := &appHandler{r, app, applog}
+
+	applog.Info("parse template")
+	// parse template
+	appParser := appfile.NewApplicationParser(r.Client, r.dm)
+
+	ctx = oamutil.SetNnamespaceInCtx(ctx, app.Namespace)
+
+  // 将 app 转换成 上面 Appfile 对象，最核心的转换是将 app 中 component、trait、scope 对象转换成 内部 Workload 对象
+	appfile, err := appParser.GenerateAppFile(ctx, app.Name, app)
+	if err != nil {
+		applog.Error(err, "[Handle Parse]")
+		app.Status.SetConditions(errorCondition("Parsed", err))
+		return handler.handleErr(err)
+	}
+
+  // 设置 app 状态 为 完成解析
+	app.Status.SetConditions(readyCondition("Parsed"))
+
+	applog.Info("build template")
+
+  // 从 appfile 转换成 ac 和 component，主要转换逻辑：
+  // 1. 从 ac 中拿到所有 workload，然后从 WorkloadDefinition 和 TraitDefinition 中获取对应对象
+  // 2. 从 Definition 中拿到 cue 定义的模版部分，将 parameter 部分数据渲染到 outputField中完成数据渲染，
+  // 3. 将 workload 渲染出来的数据构建成 Component 对象，将 trait、scope 渲染出来的数据构建 acCompoent
+	ac, comps, err := appParser.GenerateApplicationConfiguration(appfile, app.Namespace)
+  
+	...
+  
+  // 创建上面渲染出来的 ac 和 compoent 组件
+	if err := handler.apply(ctx, ac, comps); err != nil {
+	}
+
+	// 检查 app 健康状态，如果失败则退出，健康检查主要检查所有对象中是否有 isHealth 字段，如果存在则说明健康。
+	appCompStatus, healthy, err := handler.statusAggregate(appfile)
+	if err != nil {
+	}
+	if !healthy {
+		// 如果不健康则 10 秒之后在重试
+	}
+	app.Status.Services = appCompStatus
+	app.Status.SetConditions(readyCondition("HealthCheck"))
+	app.Status.Phase = v1alpha2.ApplicationRunning
+	// Gather status of components
+  // 生成所有组件的状态，包括 gvk、name、uuid
+	var refComps []v1alpha1.TypedReference
+	for _, comp := range comps {
+		refComps = append(refComps, v1alpha1.TypedReference{
+			APIVersion: comp.APIVersion,
+			Kind:       comp.Kind,
+			Name:       comp.Name,
+			UID:        app.UID,
+		})
+	}
+	app.Status.Components = refComps
+	return ctrl.Result{}, r.UpdateStatus(ctx, app)
+}
+```
+
+#### ApplicationDeployment(ad)
+
+##### CRD
+
+```go
+type AppRollout struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   AppRolloutSpec   `json:"spec,omitempty"`
+	Status AppRolloutStatus `json:"status,omitempty"`
+}
+
+// AppRolloutSpec defines how to describe an upgrade between different apps
+type AppRolloutSpec struct {
+  // TargetAppRevisionName，用于配置需要升级到哪个版本的 ac，这里配置 ac 名字即可，必填字段
+	TargetAppRevisionName string `json:"targetApplicationName"`
+
+  // SourceApplicationName，对应上一个字段，此字段用于配置哪个版本的 ac 需要升级，该字段只有在首次发布时可以为空
+	SourceApplicationName string `json:"sourceApplicationName,omitempty"`
+
+  // ComponentList，对于 ac 中需要更新的 component 列表
+  // 目前只支持单 component 的 ac 进行更新，后续会支持多 component
+	ComponentList []string `json:"componentList,omitempty"`
+
+	// RolloutPlan，用于定义滚动升级具体执行计划
+	RolloutPlan v1alpha1.RolloutPlan `json:"rolloutPlan"`
+
+	// RevertOnDelete revert the rollout when the rollout CR is deleted
+	// It will remove the target app from the kubernetes if it's set to true
+	// +optional
+	RevertOnDelete *bool `json:"revertOnDelete,omitempty"`
+}
+
+// RolloutPlan fines the details of the rollout plan
+type RolloutPlan struct {
+
+	// RolloutStrategy ，用于定义滚动计划的策略：IncreaseFirst（新增加）、DecreaseFirst（先减少）
+  // 这个配置类似于 deployment RollingUpdateStrategy ，关于 max unavailable, max surge 的定义
+	// +optional
+	RolloutStrategy *RolloutStrategyType `json:"rolloutStrategy,omitempty"`
+
+	// TargetSize，用于定义需要执行滚动升级的总副本数
+	// +optional
+	TargetSize *int32 `json:"targetSize,omitempty"`
+
+	// NumBatches，用于定义分几批进行更新
+	// +optional
+	NumBatches *int32 `json:"numBatches,omitempty"`
+
+  // 每次分批的确切信息，里面包含当前批次：副本数、pod 列表、最大不可用 pod 数、滚动间隔、分批滚动 webhook、监控指标
+	RolloutBatches []RolloutBatch `json:"rolloutBatches,omitempty"`
+
+	// 该字段应该是类似于 sts 中的 Partition，进行分区更新， 所有序号大于等于该分区序号的 Pod 都会被更新。 
+  // 所有序号小于该分区序号的 Pod 都不会被更新，并且，即使他们被删除也会依据之前的版本进行重建
+	BatchPartition *int32 `json:"batchPartition,omitempty"`
+
+	// 滚动暂停，类似deployment 中 paused 字段，当前分批执行滚动之后，下一批才能暂停。
+	// +optional
+	Paused bool `json:"paused,omitempty"`
+
+	// RolloutWebhooks，每次分批更新都会出发一次外部接口调用
+	// +optional
+	RolloutWebhooks []RolloutWebhook `json:"rolloutWebhooks,omitempty"`
+
+	// CanaryMetric，用于定义 判定当前更新是否有效，以及是否进行下批更新的标准，类似于 argocd 里面的 metrics指标，比如 http 502 请求qps 低于某个阈值判定更新有效，否则将会进行回滚
+	// before complete the process
+	// +optional
+	CanaryMetric []CanaryMetric `json:"canaryMetric,omitempty"`
+}
+```
+
+
 
 #### DAG
