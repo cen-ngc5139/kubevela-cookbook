@@ -1726,6 +1726,160 @@ type RolloutPlan struct {
 }
 ```
 
+##### Reconcile
+
+```go
+// applicationdeploymentController
+// Reconcile is the main logic of applicationdeployment controller
+func (r *Reconciler) Reconcile(req ctrl.Request) (res reconcile.Result, retErr error) {
+	// 这里省略初始化 ad 对象，和获取当前入队 ad 对象
+  ...
+
+	// TODO: check if the target/source has changed
+  // 预期：ad 对象被标记为待删除时，拦截器检查入队 ad 对象 目标和源 ac 对象是否发生变化
+	r.handleFinalizer(&appRollout)
+
+	ctx = oamutil.SetNamespaceInCtx(ctx, appRollout.Namespace)
+
+	// Get the target application
+  // 获取目标、源 ac 对象
+	var targetApp oamv1alpha2.ApplicationConfiguration
+	sourceApp := &oamv1alpha2.ApplicationConfiguration{}
+  // 获取目标 ac 当前版本名称
+	targetAppName := appRollout.Spec.TargetAppRevisionName
+	if err := r.Get(ctx, ktypes.NamespacedName{Namespace: req.Namespace, Name: targetAppName},
+		&targetApp); err != nil {
+		...
+	}
+
+	// Get the source application
+  // 获取源 ac 对象当前版本名称
+	sourceAppName := appRollout.Spec.SourceApplicationName
+  // 如果 ad 中没有配置源 ac 对象版本名称，则说明当前发布中的应用时首次发布
+	if sourceAppName == "" {
+		klog.Info("source app fields not filled, we assume it is deployed for the first time")
+		sourceApp = nil
+    // 如果源 ac 对象版本名称存在，则从 k8s 中获取当前 ac 对象
+	} else if err := r.Get(ctx, ktypes.NamespacedName{Namespace: req.Namespace, Name: sourceAppName}, sourceApp); err != nil {
+			。。。
+	}
+
+  // 将目标、源 ac 对象中的 component 组件渲染成内部 `Workload` 对象，主要逻辑如下：
+  // 1. 如果 ad 对象中 Spec.ComponentList 中没有定义 component，则从所有 ac 对象中获取一个主要的 component 来进行滚动升级，前面也说过，目前 ad 只支持对单 component 的 ac 对象进行滚动升级，后续会支持多 component
+  // 2. 如果 ad 对象中 Spec.ComponentList 以及声明，默认从列表中获取第一个 component 进行滚动升级
+  // 3. 以上以及找到目标、源 ac 中需要滚动更新的 componentName，这里名称应该是一致的
+  // 4. 按照 componentName 获取最底层的工作负载，这里的工作负载指 WorkloadDefin 中定义的。这里获取方法如下：
+  // 		a. 从 ac 对象中获取 componentName 对应的 acc 对象，acc 对象指的 ApplicationConfigurationComponent
+  // 		b. 从上面 acc 对象中获取版本名称，revisionname，并从中提取出版本号
+  // 		c. 如果上面 acc 对象 revisionName 不为空，则用 revisionName 获取当前 k8s 中实例化之后的 component 资源，如果没有配置revisionName 则用 componentName 获取
+  // 		d. 从上面获取的 component 对象中拿到真实工作负载的对象，并且转换为 unstructured.Unstructured 对象
+  // 		e. 这里需要处理几种特殊工作负载：openkruise 中的 cloneset/statefulset，component 的名称和最终落到 k8s 中对象名称是不一致的，最终的名字一直是componentName，如果使用revisionName 话会影响上述两个工作负载的 in-place 即原地升级功能能，所以这里需要调用 SetAppWorkloadInstanceName 来做一次适配
+  // 		f. 通过前面获取的 namespace、gvk、name 等信息从 k8s 总获取正在运行中的工作负载对象，即 deployment、sts等等工作负载
+  // 5. 按照上面的方法获取目标、源 ac 中真正允许在 k8s 中的工作负载对象
+	targetWorkload, sourceWorkload, err := r.extractWorkloads(ctx, appRollout.Spec.ComponentList, &targetApp, sourceApp)
+	if err != nil {
+		...
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, client.IgnoreNotFound(err)
+	}
+	klog.InfoS("get the target workload we need to work on", "targetWorkload", klog.KObj(targetWorkload))
+
+	if sourceWorkload != nil {
+		klog.InfoS("get the source workload we need to work on", "sourceWorkload", klog.KObj(sourceWorkload))
+	}
+  // 上述已经完成目标、源真正需要操作的工作负载对象，下面就进入滚动升级的核心控制器 rolloutPlanController
+
+	// reconcile the rollout part of the spec given the target and source workload
+	rolloutPlanController := rollout.NewRolloutPlanController(r, &appRollout, r.record,
+		&appRollout.Spec.RolloutPlan, &appRollout.Status.RolloutStatus, targetWorkload, sourceWorkload)
+	result, rolloutStatus := rolloutPlanController.Reconcile(ctx)
+	// make sure that the new status is copied back
+	appRollout.Status.RolloutStatus = *rolloutStatus
+	if rolloutStatus.RollingState == v1alpha1.RolloutSucceedState {
+		// remove the rollout annotation so that the target appConfig controller can take over the rest of the work
+		oamutil.RemoveAnnotations(&targetApp, []string{oam.AnnotationAppRollout})
+		if err := r.Update(ctx, &targetApp); err != nil {
+			klog.ErrorS(err, "cannot remove the rollout annotation", "target application",
+				klog.KRef(req.Namespace, targetAppName))
+			return ctrl.Result{}, err
+		}
+	}
+	// update the appRollout status
+	return result, r.updateStatus(ctx, &appRollout)
+}
+```
+
+```go
+// rolloutPlanController
+// Reconcile reconciles a rollout plan
+func (r *Controller) Reconcile(ctx context.Context) (res reconcile.Result, status *v1alpha1.RolloutStatus) {
+	klog.InfoS("Reconcile the rollout plan", "rollout Spec", r.rolloutSpec,
+		"target workload", klog.KObj(r.targetWorkload))
+	if r.sourceWorkload != nil {
+		klog.InfoS("We will do rolling upgrades", "source workload", klog.KObj(r.sourceWorkload))
+	}
+	klog.InfoS("rollout status", "rollout state", r.rolloutStatus.RollingState, "batch rolling state",
+		r.rolloutStatus.BatchRollingState, "current batch", r.rolloutStatus.CurrentBatch, "upgraded Replicas",
+		r.rolloutStatus.UpgradedReplicas)
+
+	defer func() {
+		klog.InfoS("Finished reconciling rollout plan", "rollout state", status.RollingState,
+			"batch rolling state", status.BatchRollingState, "current batch", status.CurrentBatch,
+			"upgraded Replicas", status.UpgradedReplicas, "reconcile result ", res)
+	}()
+	status = r.rolloutStatus
+
+	defer func() {
+		if status.RollingState == v1alpha1.RolloutFailedState ||
+			status.RollingState == v1alpha1.RolloutSucceedState {
+			// no need to requeue if we reach the terminal states
+			res = reconcile.Result{}
+		} else {
+			res = reconcile.Result{
+				RequeueAfter: rolloutReconcileRequeueTime,
+			}
+		}
+	}()
+
+	workloadController, err := r.GetWorkloadController()
+	if err != nil {
+		r.rolloutStatus.RolloutFailed(err.Error())
+		r.recorder.Event(r.parentController, event.Warning("Unsupported workload", err))
+		return
+	}
+
+	switch r.rolloutStatus.RollingState {
+	case v1alpha1.VerifyingState:
+		r.rolloutStatus = workloadController.Verify(ctx)
+
+	case v1alpha1.InitializingState:
+		if err := r.initializeRollout(ctx); err == nil {
+			r.rolloutStatus = workloadController.Initialize(ctx)
+		}
+
+	case v1alpha1.RollingInBatchesState:
+		r.reconcileBatchInRolling(ctx, workloadController)
+
+	case v1alpha1.FinalisingState:
+		r.rolloutStatus = workloadController.Finalize(ctx)
+		// if we are still going to finalize it
+		if r.rolloutStatus.RollingState == v1alpha1.FinalisingState {
+			r.finalizeRollout(ctx)
+		}
+
+	case v1alpha1.RolloutSucceedState:
+		// Nothing to do
+
+	case v1alpha1.RolloutFailedState:
+		// Nothing to do
+
+	default:
+		panic(fmt.Sprintf("illegal rollout status %+v", r.rolloutStatus))
+	}
+
+	return res, r.rolloutStatus
+}
+```
+
 
 
 #### DAG
