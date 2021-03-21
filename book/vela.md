@@ -22,6 +22,9 @@
 
 <img src="../image/kubevela-how-it-works.png" />
 
+> 微信公众号：**[朱慧君]**大龄yaml工程师瞎逼逼
+> 关注容器技术、关注`Kubernetes`。问题或建议，请公众号留言。
+
 ##  项目组件
 
 | 组件名称  | 功能                                                         | 入口目录                          |
@@ -810,14 +813,17 @@ func DefaultPodSpecWorkload(obj *v1alpha1.PodSpecWorkload) {
 
 ##### 总揽
 
-| GV                    | Kind                     | 说明 |
-| --------------------- | ------------------------ | ---- |
-| core.oam.dev/v1alpha2 | ApplicationConfiguration |      |
-| core.oam.dev/v1alpha2 | ContainerizedWorkload    |      |
-| core.oam.dev/v1alpha2 | ManualScalerTrait        |      |
-| core.oam.dev/v1alpha2 | HealthScope              |      |
-| core.oam.dev/v1alpha2 | Application              |      |
-| core.oam.dev/v1alpha2 | ApplicationDeployment    |      |
+| GV                    | Kind                                                    | 说明 |
+| --------------------- | ------------------------------------------------------- | ---- |
+| core.oam.dev/v1alpha2 | ApplicationConfiguration                                |      |
+| core.oam.dev/v1alpha2 | ContainerizedWorkload                                   |      |
+| core.oam.dev/v1alpha2 | ManualScalerTrait                                       |      |
+| core.oam.dev/v1alpha2 | HealthScope                                             |      |
+| core.oam.dev/v1alpha2 | Application                                             |      |
+| core.oam.dev/v1alpha2 | ~~ApplicationDeployment~~   ------>  ApplicationRollout |      |
+| core.oam.dev/v1alpha2 | ApplicationContext                                      |      |
+| core.oam.dev/v1alpha2 | TraitDefinition                                         |      |
+| core.oam.dev/v1alpha2 | ComponentDefinition                                     |      |
 
 ```go
 // Setup workload controllers.
@@ -1656,6 +1662,28 @@ func (r *Reconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 
 #### ApplicationDeployment(ad)
 
+##### example
+
+```yaml
+apiVersion: core.oam.dev/v1alpha2
+kind: AppRollout
+metadata:
+  name: rolling-test
+spec:
+  # application (revision) reference
+  targetAppRevisionName: test-rolling-v2
+  sourceAppRevisionName: test-rolling-v1
+  # HPA reference (optional)
+  componentList:
+    - metrics-provider
+  rolloutPlan:
+    rolloutStrategy: "IncreaseFirst"
+    rolloutBatches:
+      - replicas: 10%
+      - replicas: 2
+      - replicas: 2
+```
+
 ##### CRD
 
 ```go
@@ -1715,7 +1743,7 @@ type RolloutPlan struct {
 	// +optional
 	Paused bool `json:"paused,omitempty"`
 
-	// RolloutWebhooks，每次分批更新都会出发一次外部接口调用
+	// RolloutWebhooks，每次分批更新都会触发一次外部接口调用
 	// +optional
 	RolloutWebhooks []RolloutWebhook `json:"rolloutWebhooks,omitempty"`
 
@@ -1766,8 +1794,8 @@ func (r *Reconciler) Reconcile(req ctrl.Request) (res reconcile.Result, retErr e
 
   // 将目标、源 ac 对象中的 component 组件渲染成内部 `Workload` 对象，主要逻辑如下：
   // 1. 如果 ad 对象中 Spec.ComponentList 中没有定义 component，则从所有 ac 对象中获取一个主要的 component 来进行滚动升级，前面也说过，目前 ad 只支持对单 component 的 ac 对象进行滚动升级，后续会支持多 component
-  // 2. 如果 ad 对象中 Spec.ComponentList 以及声明，默认从列表中获取第一个 component 进行滚动升级
-  // 3. 以上以及找到目标、源 ac 中需要滚动更新的 componentName，这里名称应该是一致的
+  // 2. 如果 ad 对象中 Spec.ComponentList 已经声明，默认从列表中获取第一个 component 进行滚动升级
+  // 3. 以上已经找到目标、源 ac 中需要滚动更新的 componentName，这里名称应该是一致的
   // 4. 按照 componentName 获取最底层的工作负载，这里的工作负载指 WorkloadDefin 中定义的。这里获取方法如下：
   // 		a. 从 ac 对象中获取 componentName 对应的 acc 对象，acc 对象指的 ApplicationConfigurationComponent
   // 		b. 从上面 acc 对象中获取版本名称，revisionname，并从中提取出版本号
@@ -1775,7 +1803,7 @@ func (r *Reconciler) Reconcile(req ctrl.Request) (res reconcile.Result, retErr e
   // 		d. 从上面获取的 component 对象中拿到真实工作负载的对象，并且转换为 unstructured.Unstructured 对象
   // 		e. 这里需要处理几种特殊工作负载：openkruise 中的 cloneset/statefulset，component 的名称和最终落到 k8s 中对象名称是不一致的，最终的名字一直是componentName，如果使用revisionName 话会影响上述两个工作负载的 in-place 即原地升级功能能，所以这里需要调用 SetAppWorkloadInstanceName 来做一次适配
   // 		f. 通过前面获取的 namespace、gvk、name 等信息从 k8s 总获取正在运行中的工作负载对象，即 deployment、sts等等工作负载
-  // 5. 按照上面的方法获取目标、源 ac 中真正允许在 k8s 中的工作负载对象
+  // 5. 按照上面的方法获取目标、源 ac 中真正运行在 k8s 中的工作负载对象
 	targetWorkload, sourceWorkload, err := r.extractWorkloads(ctx, appRollout.Spec.ComponentList, &targetApp, sourceApp)
 	if err != nil {
 		...
@@ -1814,57 +1842,57 @@ func (r *Reconciler) Reconcile(req ctrl.Request) (res reconcile.Result, retErr e
 func (r *Controller) Reconcile(ctx context.Context) (res reconcile.Result, status *v1alpha1.RolloutStatus) {
 	klog.InfoS("Reconcile the rollout plan", "rollout Spec", r.rolloutSpec,
 		"target workload", klog.KObj(r.targetWorkload))
+  // 如果源workload不为空，则说明需要执行滚动升级
 	if r.sourceWorkload != nil {
 		klog.InfoS("We will do rolling upgrades", "source workload", klog.KObj(r.sourceWorkload))
 	}
-	klog.InfoS("rollout status", "rollout state", r.rolloutStatus.RollingState, "batch rolling state",
-		r.rolloutStatus.BatchRollingState, "current batch", r.rolloutStatus.CurrentBatch, "upgraded Replicas",
-		r.rolloutStatus.UpgradedReplicas)
+  ...
 
 	defer func() {
-		klog.InfoS("Finished reconciling rollout plan", "rollout state", status.RollingState,
-			"batch rolling state", status.BatchRollingState, "current batch", status.CurrentBatch,
-			"upgraded Replicas", status.UpgradedReplicas, "reconcile result ", res)
+		//打印当前批次执行信息
 	}()
 	status = r.rolloutStatus
 
 	defer func() {
 		if status.RollingState == v1alpha1.RolloutFailedState ||
 			status.RollingState == v1alpha1.RolloutSucceedState {
+       // 如果 滚动升级 状态 为 fail 或者 success，说明已经到达最终的逻辑状态，就不需要在进行重新执行 Reconcil
 			// no need to requeue if we reach the terminal states
 			res = reconcile.Result{}
 		} else {
+        // 如果当前状态还处于中间状态，则需要5秒之后重新调度执行 Reconcil
 			res = reconcile.Result{
 				RequeueAfter: rolloutReconcileRequeueTime,
 			}
 		}
 	}()
 
+  // 选择已经支持的 Workload 进行滚动升级操作，目前支持 openKruise.CloneSet 以及原生 deployment 做为滚动升级的控制器
 	workloadController, err := r.GetWorkloadController()
 	if err != nil {
+    // 如果没有找到合适的 Workload，则标记该滚动升级任务失败
 		r.rolloutStatus.RolloutFailed(err.Error())
+    // 为 ad 生成事件，记录当前 Reconcil 状态
 		r.recorder.Event(r.parentController, event.Warning("Unsupported workload", err))
 		return
 	}
 
 	switch r.rolloutStatus.RollingState {
-	case v1alpha1.VerifyingState:
-		r.rolloutStatus = workloadController.Verify(ctx)
-
+    // 如果当前 ad 状态为 verifyingSpec 校验中，则执行参数校验。
+	case v1alpha1.VerifyingSpecState:
+		...
+		// 如果当前 ad 状态为 initializing，执行以下操作初始化操作
 	case v1alpha1.InitializingState:
-		if err := r.initializeRollout(ctx); err == nil {
-			r.rolloutStatus = workloadController.Initialize(ctx)
-		}
-
+		...
+		// 如果状态为 rollingInBatches ，说明当前处于 滚动升级中。。。
 	case v1alpha1.RollingInBatchesState:
-		r.reconcileBatchInRolling(ctx, workloadController)
-
+		...
+    // 如果 ad 状态为 rolloutFailing， 则进行结束操作，需要将 ad 从滚动升级对象的 own 中清除
+	case v1alpha1.RolloutFailingState:
+		...
+		// 如果 ad 状态为 finalising，跟上一步处理方式一样
 	case v1alpha1.FinalisingState:
-		r.rolloutStatus = workloadController.Finalize(ctx)
-		// if we are still going to finalize it
-		if r.rolloutStatus.RollingState == v1alpha1.FinalisingState {
-			r.finalizeRollout(ctx)
-		}
+		...
 
 	case v1alpha1.RolloutSucceedState:
 		// Nothing to do
@@ -1880,6 +1908,65 @@ func (r *Controller) Reconcile(ctx context.Context) (res reconcile.Result, statu
 }
 ```
 
+##### RolloutStateTransition
 
+该章节主要用于记录滚动升级过程中的状态流转
 
-#### DAG
+![](../image/approllout-status-transition.jpg)
+
+-  ***VerifyingSpecState***，状态为默认初始状态，如果当前 ad 状态为 verifyingSpec 校验中，则执行参数校验，这里涉及到两种工作负载（CloneSet 和 Deployment），基本逻辑一致：
+
+  - 对比 Spec 配置部分 hash 值，是否一致，如果一致说明配置没有发生变化，退出滚动升级逻辑。
+  - 检查目标对象副本数是否合法，如果目标副本数 大于 当前副本数，则不允许进行滚动升级；如果滚动升级 所有批次副本数总数是否与 当前副本数一致，如果不一致则不允许滚动升级。
+  - 检查目标、源对象是否处于暂停状态，如果没有暂停说明当前可能正在进行滚动升级，退出滚动升级逻辑。
+  - 检查目标、源对象是否已经被其他控制器控制，这里主要通过检查 OwnerReferences 配置，如果已经被控制，退出滚动升级逻辑。
+  - 在通过上述检查之后，滚动升级状态将流转到 `initializing`。
+
+-  ***InitializingState***，该状态为初始化阶段，当前阶段操作基本逻辑为：
+
+  -  执行所有滚动升级任务中的 RolloutWebhook ，如果 httpcode 非200，则将 ad RollingState 状态设置成 rolloutFailing，BatchRollingState 状态设置成 BatchInitializingState。
+
+  - 如果上一步执行通过，则进行两种 workload 的初始化操作，分别为 CloneSet、Deployment
+
+    - CloneSet：
+
+      - 获取当前 cs 对象的总共副本数。
+
+      - 获取当前 cs 对象 own 信息，如果当前 own 已经是 ad，则直接退出当前流程。
+
+      - 解除 cs 对象暂停状态，设置滚动升级 Partition 为当前源 cs 对象副本数，前面两个配置不会导致 cs 进行 pod 重建操作，只有当 Partition 小于当前副本数时，才会重建 副本数-Partition 数量的 pod。
+
+      - 如果当前 cs 对象没有配置 own 信息，则将 own 设置成 ad，并更新当前 cs 对象，这样就完成 cs 对象的初始化。
+
+        
+
+    - Deployment：
+
+      -  获取目标、源 deployment 对象。
+      - 分别确认上述两个对象 own 是否为 ad，如果没有将 own 设置为 ad。
+      - 解除 deployment 对象暂停状态。
+      - 提交上述配置到目标、源 deployment对象。
+
+  - 在通过上述检查之后，滚动升级状态将流转到 `rollingInBatches`。
+
+- ***RollingInBatchesState***，该状态为滚动阶段，当前阶段基本逻辑为：
+  -  获取 ad.spec.Paused 字段，判断是否处于暂停状态，如果是则跳过本次操作。
+  - 校验当前已经更新副本数 和 批次，如果校验失败，则将滚动升级状态更改成rolloutFailing，主要逻辑如下：
+    - spec.BatchPartition 字段不为空，该字段用于管理员手动控制滚动进度，类似 sts 中的 Partition，如果期望 BatchPartition 小于 当前批次，说明控制器没有能够正常暂停，校验失败。
+    - 获取截止上一批次所有滚动 pod 总数，如果当前 已经更新副本数 小于 前面的值，说明上一批还没有更新完毕，校验失败。
+    - 如果当前批次为最后一批，那么当前批次的预期副本数等于 预期总副本数，如果不是则计算当前批次期望副本数。
+    - 如果当前已经更新副本数 大于 当前批次预期副本数，说明滚动升级状态异常，校验失败。
+  - 获取 `r.rolloutStatus.BatchRollingState` 状态，处理不同状态逻辑如下：
+    - 如果 `batchInitializin` 状态，说明分批滚动处于初始化状态，将执行滚动升级前置逻辑，前置逻辑将请求 `BatchRolloutWebhooks` 中定义 `type` 为 `pre-batch-rollout` 的 `webhook`。
+    - 如果 batchInRolling 状态，说明分批滚动处于进行中，则对 CloneSet、Deployment 进行单步滚动操作，如果执行成功则将状态修改为 RolloutOneBatchEvent，CloneSet 主要通过调整Spec.UpdateStrategy.Partition 配置来进行手动控制滚动升级进度。
+    - Deployment则是通过相对复杂需要区分是否为首批：
+      - 如果是首批，根据rolloutStrategy判断是 先缩容还是先扩容，如果先扩容，则将源 deployment 进行缩容操作；如果是扩容，则将目标 deployment 进行扩容操作。扩缩容 pod 数量，由每批次 pod 数量决定，比如第一批次操作 1 个容器，扩缩容的 pod 数量就是 1。
+      - 如果不是首批，且需要先扩容，则先获取 maxUnavail pod 数量，随后与当前目标 deployment 就绪容器数量相加，如果总和大于 目标 deployment 总副本数，说明目标 deployment 已经就绪可以对 源 deployment 进行缩容操作，否则不能对源 deployment 进行缩容操作； 如果先缩容，则说明目标 deployment 已经扩容成功，本阶段将对源 deployment 进行缩容操作。
+    - 如果 batchVerifying 状态，当前批次已经完成执行升级，进入校验阶段，主要校验目标、源 对象副本数是否符合预期，如果符合则说明当前批次通过，可以进行下一批次的操作。对于 cloneset ，主要检查 MaxUnavailable + UpdatedReadyReplicas 是否 >= 目标副本总数，如果是则说明当前批次完成，将分批状态修改成 batchFinalizing，否则需要进行等待。
+    - 如果 batchFinalizing 状态，执行后置任务，类型为 post-batch-rollout。
+    - 如果 batchReady 状态，说明当前批次已经通过校验，可以进行下一批 pod 滚动升级，将 BatchRollingState 状态再次设置成 batchInitializing。
+  - 在上述操作正常执行，滚动升级状态将流转到 `finalising`。
+
+#### ApplicationContext
+
+#### DSL
