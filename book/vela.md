@@ -22,8 +22,8 @@
 
 <img src="../image/kubevela-how-it-works.png" />
 
-> 微信公众号：**[朱慧君]**大龄yaml工程师瞎逼逼
-> 关注容器技术、关注`Kubernetes`。问题或建议，请公众号留言。
+>微信公众号：**朱慧君** 大龄yaml工程师瞎逼逼
+>关注容器技术、关注`Kubernetes`。问题或建议，请公众号留言。
 
 ##  项目组件
 

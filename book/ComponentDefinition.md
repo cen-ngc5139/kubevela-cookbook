@@ -184,7 +184,7 @@ type ComponentDefinitionStatus struct {
 
 ## Reconcile
 
-![ComponentDefinition](../image/ComponentDefinition.jpg)
+![](../image/ComponentDefinition.jpg)
 
 ```go
 // Reconcile is the main logic for ComponentDefinition controller
